@@ -178,6 +178,10 @@ class RememberColorBaseEnv(BaseEnv):
                         self.cubes[key].pose = current_pose
 
             self.oracle_info = self.true_color_indices
+            
+            # Store original poses for cube restoration in evaluate()
+            # This must be done ONCE per episode, not every step
+            self.original_poses = {key: self.cubes[key].pose.raw_pose.clone() for key in self.cubes.keys()}
 
             # Initialize robot arm to a higher position above the table than the default typically used for other table top tasks
             if self.robot_uids == "panda" or self.robot_uids == "panda_wristcam":
@@ -195,7 +199,8 @@ class RememberColorBaseEnv(BaseEnv):
                 raise NotImplementedError(self.robot_uids)
 
     def evaluate(self):
-        self.original_poses = {key: self.cubes[key].pose.raw_pose.clone() for key in self.cubes.keys()}
+        # Note: self.original_poses is initialized once in _initialize_episode()
+        # and should NOT be recreated here, as that would capture hidden cube positions
         
         hidden_shapes_poses = {}
         for key, shape in self.color_dict.items():

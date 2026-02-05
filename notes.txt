@@ -1,0 +1,5 @@
+- training oracle policy in pd_joint_pos control control_mode does not work
+- ppo lstm implementation here weird. it should be like sb3 contrib rucurrent ppo. 
+  but the implementation here is different - The LSTM hidden state used for training is 
+  next_lstm_state, which is the hidden state from the START of the rollout (line 858), 
+  not the hidden state that evolves through the sequence.
