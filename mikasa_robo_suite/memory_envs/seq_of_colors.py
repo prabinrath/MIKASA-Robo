@@ -209,6 +209,10 @@ class SeqOfColorsEnv(BaseEnv):
             self.initial_poses = {key: self.cubes[key].pose.raw_pose.clone() for key in self.cubes.keys()}
 
             self.oracle_info = self.true_color_indices
+            
+            # Store original poses for cube restoration in evaluate()
+            # This must be done ONCE per episode, not every step
+            self.original_poses = {key: self.cubes[key].pose.raw_pose.clone() for key in self.cubes.keys()}
 
             # Initialize robot arm to a higher position above the table than the default typically used for other table top tasks
             if self.robot_uids == "panda" or self.robot_uids == "panda_wristcam":
@@ -226,9 +230,9 @@ class SeqOfColorsEnv(BaseEnv):
                 raise NotImplementedError(self.robot_uids)
 
     def evaluate(self):
-        # ! iw works and mey be it's more oprimal
-        self.original_poses = {key: self.cubes[key].pose.raw_pose.clone() for key in self.cubes.keys()}
-
+        # Note: self.original_poses is initialized once in _initialize_episode()
+        # and should NOT be recreated here, as that would capture hidden cube positions
+        
         show_sequence_mask = self.elapsed_steps < (self.STEP_DURATION * self.SEQUENCE_LENGTH)
 
         seq_time = torch.clamp(self.elapsed_steps // self.STEP_DURATION, 0, self.SEQUENCE_LENGTH - 1)

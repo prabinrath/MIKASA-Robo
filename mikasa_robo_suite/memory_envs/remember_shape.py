@@ -271,6 +271,10 @@ class RememberShapeBaseEnv(BaseEnv):
                         self.shapes[key].pose = current_pose
 
             self.oracle_info = self.true_shape_indices
+            
+            # Store original poses for shape restoration in evaluate()
+            # This must be done ONCE per episode, not every step
+            self.original_poses = {key: self.shapes[key].pose.raw_pose.clone() for key in self.shapes.keys()}
 
             # Initialize robot arm to a higher position above the table than the default typically used for other table top tasks
             if self.robot_uids == "panda" or self.robot_uids == "panda_wristcam":
@@ -288,8 +292,9 @@ class RememberShapeBaseEnv(BaseEnv):
                 raise NotImplementedError(self.robot_uids)
 
     def evaluate(self):
-        self.original_poses = {key: self.shapes[key].pose.raw_pose.clone() for key in self.shapes.keys()}
-
+        # Note: self.original_poses is initialized once in _initialize_episode()
+        # and should NOT be recreated here, as that would capture hidden shape positions
+        
         hidden_shapes_poses = {}
         for key, shape in self.shape_dict.items():
             hidden_shapes_poses[key] = self.shapes[key].pose.raw_pose.clone()
