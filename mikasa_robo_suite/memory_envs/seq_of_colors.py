@@ -248,13 +248,21 @@ class SeqOfColorsEnv(BaseEnv):
             b_ = hidden_shapes_poses[key].shape[0]
 
             hidden_shapes_poses[key][true_shape_masks[key], :3] = self.center_pose.repeat(b_, 1)[true_shape_masks[key], :3]
-            hidden_shapes_poses[key][~true_shape_masks[key], 2] = 1000  # Raise non-target cubes
+            hidden_shapes_poses[key][~true_shape_masks[key] & show_sequence_mask, 2] = 1000  # Raise non-target cubes
 
             hidden_shapes_poses[key][empty_table, 2] = 1000
-            
-            hidden_shapes_poses[key][mask, :3] = self.original_poses[key][mask, :3]            
+
+            transition_mask = self.elapsed_steps == self.STEP_DURATION * self.SEQUENCE_LENGTH + self.EMPTY_DURATION
+            hidden_shapes_poses[key][transition_mask, :3] = self.initial_poses[key][transition_mask, :3]
 
             self.cubes[key].pose = hidden_shapes_poses[key]
+            if transition_mask.any():
+                lin_vel = self.cubes[key].get_linear_velocity()
+                ang_vel = self.cubes[key].get_angular_velocity()
+                lin_vel[transition_mask] = 0
+                ang_vel[transition_mask] = 0
+                self.cubes[key].set_linear_velocity(lin_vel)
+                self.cubes[key].set_angular_velocity(ang_vel)
 
         sequence_cubes_mask = torch.zeros((b_, len(self.color_dict)), dtype=torch.bool, device=self.device)
         sequence_cubes_mask.scatter_(1, self.true_color_indices.long(), True)

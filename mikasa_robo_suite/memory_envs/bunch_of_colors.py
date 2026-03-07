@@ -279,12 +279,21 @@ class BunchOfColorsEnv(BaseEnv):
                 torch.where(
                     empty_table_expanded | (~mask_target.unsqueeze(-1) & show_initial_expanded),
                     torch.tensor([0, 0, 1000.0], device=self.device),
-                    self.original_poses[key][..., :3]
+                    hidden_shapes_poses[key][..., :3]
                 )
             )
-            
+
             hidden_shapes_poses[key][..., :3] = new_pos
+            transition_mask = self.elapsed_steps == (self.STEP_DURATION + self.EMPTY_DURATION)
+            hidden_shapes_poses[key][transition_mask, :3] = self.initial_poses[key][transition_mask, :3]
             self.cubes[key].pose = hidden_shapes_poses[key]
+            if transition_mask.any():
+                lin_vel = self.cubes[key].get_linear_velocity()
+                ang_vel = self.cubes[key].get_angular_velocity()
+                lin_vel[transition_mask] = 0
+                ang_vel[transition_mask] = 0
+                self.cubes[key].set_linear_velocity(lin_vel)
+                self.cubes[key].set_angular_velocity(ang_vel)
         
         sequence_cubes_mask = torch.zeros((b_, len(self.color_dict)), dtype=torch.bool, device=self.device)
         sequence_cubes_mask.scatter_(1, self.true_color_indices.long(), True)

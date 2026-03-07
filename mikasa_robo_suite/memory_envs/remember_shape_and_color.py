@@ -294,7 +294,8 @@ class RememberShapeAndColorBaseEnv(BaseEnv):
             true_shape_mask = self.true_shape_indices == key
             b_ = hidden_shapes_poses[key].shape[0]
 
-            hidden_shapes_poses[key][true_shape_mask, :3] = self.center_pose.repeat(b_, 1)[true_shape_mask, :3]
+            pre_choice_mask = true_shape_mask & (self.elapsed_steps < self.TIME_OFFSET + self.DELTA_TIME)
+            hidden_shapes_poses[key][pre_choice_mask, :3] = self.center_pose.repeat(b_, 1)[pre_choice_mask, :3]
 
             hidden_shapes_poses[key][
                 true_shape_mask \
@@ -306,11 +307,16 @@ class RememberShapeAndColorBaseEnv(BaseEnv):
             self.shapes[key].pose = hidden_shapes_poses[key]
 
         for key, shape in self.shape_color_dict.items():
-            mask = self.elapsed_steps >= self.TIME_OFFSET + self.DELTA_TIME
-            # TODO: (if uncomment) in this mode, objects will rotate around their axis when interacting with the manipulator, but will not move from their place
-            # hidden_shapes_poses[key][mask, :3] = self.initial_poses[key][mask, :3] 
-            hidden_shapes_poses[key][mask, :3] = self.original_poses[key][mask, :3]
+            mask = self.elapsed_steps == self.TIME_OFFSET + self.DELTA_TIME
+            hidden_shapes_poses[key][mask, :3] = self.initial_poses[key][mask, :3]
             self.shapes[key].pose = hidden_shapes_poses[key]
+            if mask.any():
+                lin_vel = self.shapes[key].get_linear_velocity()
+                ang_vel = self.shapes[key].get_angular_velocity()
+                lin_vel[mask] = 0
+                ang_vel[mask] = 0
+                self.shapes[key].set_linear_velocity(lin_vel)
+                self.shapes[key].set_angular_velocity(ang_vel)
             
         self.masks = {}
         for key, shape in self.shape_color_dict.items():
