@@ -2,10 +2,6 @@ from typing import Any, Dict
 import numpy as np
 import sapien
 import torch
-from transforms3d.euler import euler2quat
-import mani_skill.envs.utils.randomization as randomization
-from mani_skill.agents.robots import Fetch, Panda
-from mani_skill.agents.robots.panda.panda_wristcam import PandaWristCam
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
@@ -14,8 +10,6 @@ from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
-from typing import Optional, Union
-from mani_skill.envs.scene import ManiSkillScene
 
 
 class RememberColorBaseEnv(BaseEnv):
@@ -29,6 +23,9 @@ class RememberColorBaseEnv(BaseEnv):
     GOAL_THRESH = 0.05    # Radius of the goal region № 0.05
     CUBE_HALFSIZE = 0.02  # Radius of the cube
     TIME_OFFSET = 5       # Time to observe the goal cube
+    DEFAULT_DELTA_TIME = 5
+    DEFAULT_MAX_EPISODE_STEPS = 60
+    OPTION_TIME = DEFAULT_MAX_EPISODE_STEPS - TIME_OFFSET - DEFAULT_DELTA_TIME
 
     # Color definitions (RGBA format)
     COLOR_MAPPING = {
@@ -43,9 +40,18 @@ class RememberColorBaseEnv(BaseEnv):
         8: ("Teal",    [0, 128, 128, 255])
     }
 
-    def __init__(self, *args, robot_uids="panda_wristcam", robot_init_qpos_noise=0.02, delta_time=5, **kwargs):
+    def __init__(
+        self,
+        *args,
+        robot_uids="panda_wristcam",
+        robot_init_qpos_noise=0.02,
+        delta_time=DEFAULT_DELTA_TIME,
+        **kwargs
+    ):
 
-        self.DELTA_TIME = delta_time
+        if delta_time < 0:
+            raise ValueError("delta_time must be non-negative")
+        self.DELTA_TIME = int(delta_time)
         # Initialize color dictionary with specified number of colors
         self.color_dict = {
             k: np.array(v[1]) / 255.0 
@@ -56,6 +62,10 @@ class RememberColorBaseEnv(BaseEnv):
         self.initial_poses = {}
         
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
+
+    @classmethod
+    def max_episode_steps_for_delta_time(cls, delta_time: int):
+        return cls.TIME_OFFSET + int(delta_time) + cls.OPTION_TIME
 
     @property
     def _default_sim_config(self):
@@ -95,142 +105,181 @@ class RememberColorBaseEnv(BaseEnv):
                 initial_pose=sapien.Pose(p=[0, 0, self.CUBE_HALFSIZE]),
             )
 
-    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
-        with torch.device(self.device):
-            b = len(env_idx)
-            self.table_scene.initialize(env_idx)
+    def _sync_cube_gpu_state(self):
+        if self.scene.gpu_sim_enabled:
+            self.scene.px.gpu_apply_rigid_dynamic_data()
+            self.scene.px.gpu_fetch_rigid_dynamic_data()
 
-            self.prompt = None
-            self.reward_dict = None
-
-            self.true_color_indices = self._batched_episode_rng.choice(list(self.color_dict.keys()))
-            self.true_color_indices = torch.from_numpy(self.true_color_indices).to(device=self.device, dtype=torch.uint8)
-
-            # * Initial position
-            xyz_initial = torch.zeros((b, 3))
-            self.center_pose = xyz_initial.clone()
-            self.center_pose[..., 2] = self.CUBE_HALFSIZE
-            self.center_pose = self.center_pose[0].unsqueeze(0)
-
-            # * Cubes
-            for key, color in self.color_dict.items():
-                xyz_cube = xyz_initial.clone()
-                if self.COLORS != 3:
-                    angle = np.pi * (key - (len(self.color_dict) // 2)) / len(self.color_dict)
-                    radius = 0.3
-
-                    xyz_cube[..., 0] = radius * np.cos(angle) - 0.25
-                    xyz_cube[..., 1] = radius * np.sin(angle)
-
-                    if self.COLORS in [5, 9]:
-                        xyz_cube[..., 1] -= (key - (len(self.color_dict) // 2)) * 0.025
-                else:
-                    xyz_cube[..., 1] -= (key - (len(self.color_dict) // 2)) * 0.1 
-                xyz_cube[..., 2] = self.CUBE_HALFSIZE
-                q = [1, 0, 0, 0]
-                obj_pose_cube = Pose.create_from_pq(p=xyz_cube, q=q)
-                self.cubes[key].set_pose(obj_pose_cube)
-                self.initial_poses[key] = xyz_cube.clone()
-
-
-            # After calculating all initial poses, but before setting them:
-            with torch.device(self.device):
-                min_distance = self.CUBE_HALFSIZE * 3  # Min distance between objects
-                max_attempts = 50  # Max attempts to find a valid position
-                
-                # Create a permutation for each environment
-                for env_i in range(b):
-                    # Get list of positions for this environment
-                    positions = [self.initial_poses[key][env_i].clone() for key in self.initial_poses.keys()]
-                    
-                    # For each position
-                    for i in range(len(positions)):
-                        attempt = 0
-                        while attempt < max_attempts:
-                            # Add random offset to current position
-                            noise = torch.randn(2, device=self.device) * self.CUBE_HALFSIZE * 0.5
-                            new_pos = positions[i].clone()
-                            new_pos[:2] += noise
-                            
-                            # Check distance to all previously placed objects
-                            valid_position = True
-                            for j in range(i):
-                                distance = torch.norm(new_pos[:2] - positions[j][:2])
-                                if distance < min_distance:
-                                    valid_position = False
-                                    break
-                            
-                            if valid_position:
-                                positions[i] = new_pos
-                                break
-                            attempt += 1
-                    
-                    # Shuffle positions
-                    shuffled_indices = torch.randperm(len(positions))
-                    shuffled_positions = [positions[i] for i in shuffled_indices]
-                    
-                    # Assign shuffled positions back
-                    for key, new_pos in zip(self.initial_poses.keys(), shuffled_positions):
-                        self.initial_poses[key][env_i] = new_pos
-                        # Update actual object poses as well
-                        current_pose = self.cubes[key].pose.raw_pose.clone()
-                        current_pose[env_i, :3] = new_pos
-                        self.cubes[key].pose = current_pose
-
-            self.oracle_info = self.true_color_indices
-
-            # Initialize robot arm to a higher position above the table than the default typically used for other table top tasks
-            if self.robot_uids == "panda" or self.robot_uids == "panda_wristcam":
-                # fmt: off
-                qpos = np.array(
-                    [0.0, 0, 0, -np.pi * 2 / 3, 0, np.pi * 2 / 3, np.pi / 4, 0.04, 0.04]
-                )
-                # fmt: on
-                qpos[:-2] += self._episode_rng.normal(
-                    0, self.robot_init_qpos_noise, len(qpos) - 2
-                )
-                self.agent.reset(qpos)
-                self.agent.robot.set_root_pose(sapien.Pose([-0.615, 0, 0]))
+    def _zero_cube_velocities(self, mask=None, sleep: bool = False):
+        for key, cube in self.cubes.items():
+            cube_mask = mask.get(key) if isinstance(mask, dict) else mask
+            lin_vel = cube.get_linear_velocity()
+            ang_vel = cube.get_angular_velocity()
+            if cube_mask is None:
+                lin_vel[:] = 0
+                ang_vel[:] = 0
             else:
-                raise NotImplementedError(self.robot_uids)
+                lin_vel[cube_mask] = 0
+                ang_vel[cube_mask] = 0
+            cube.set_linear_velocity(lin_vel)
+            cube.set_angular_velocity(ang_vel)
+            if sleep:
+                sleep_mask = (
+                    None if cube_mask is None
+                    else cube_mask.detach().to("cpu", dtype=torch.bool)
+                )
+                for env_i, body in enumerate(getattr(cube, "_bodies", [])):
+                    if sleep_mask is not None and (
+                        env_i >= len(sleep_mask) or not bool(sleep_mask[env_i].item())
+                    ):
+                        continue
+                    body.put_to_sleep()
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        b = len(env_idx)
+        self.table_scene.initialize(env_idx)
+
+        self.prompt = None
+        self.reward_dict = None
+
+        self.true_color_indices = self._batched_episode_rng.choice(list(self.color_dict.keys()))
+        self.true_color_indices = torch.from_numpy(self.true_color_indices).to(device=self.device, dtype=torch.uint8)
+
+        # * Initial position
+        xyz_initial = torch.zeros((b, 3), device=self.device)
+        self.center_pose = xyz_initial.clone()
+        self.center_pose[..., 2] = self.CUBE_HALFSIZE
+        self.center_pose = self.center_pose[0].unsqueeze(0)
+
+        # * Cubes
+        for key, color in self.color_dict.items():
+            xyz_cube = xyz_initial.clone()
+            if self.COLORS != 3:
+                angle = np.pi * (key - (len(self.color_dict) // 2)) / len(self.color_dict)
+                radius = 0.3
+
+                xyz_cube[..., 0] = radius * np.cos(angle) - 0.25
+                xyz_cube[..., 1] = radius * np.sin(angle)
+
+                if self.COLORS in [5, 9]:
+                    xyz_cube[..., 1] -= (key - (len(self.color_dict) // 2)) * 0.025
+            else:
+                xyz_cube[..., 1] -= (key - (len(self.color_dict) // 2)) * 0.1
+            xyz_cube[..., 2] = self.CUBE_HALFSIZE
+            q = [1, 0, 0, 0]
+            obj_pose_cube = Pose.create_from_pq(p=xyz_cube, q=q)
+            self.cubes[key].set_pose(obj_pose_cube)
+            self.initial_poses[key] = xyz_cube.clone()
+
+        # After calculating all initial poses, but before setting them:
+        min_distance = self.CUBE_HALFSIZE * 3  # Min distance between objects
+        max_attempts = 50  # Max attempts to find a valid position
+
+        # Create a permutation for each environment
+        for env_i in range(b):
+            # Get list of positions for this environment
+            positions = [self.initial_poses[key][env_i].clone() for key in self.initial_poses.keys()]
+
+            # For each position
+            for i in range(len(positions)):
+                attempt = 0
+                while attempt < max_attempts:
+                    # Add random offset to current position
+                    noise = torch.randn(2, device=self.device) * self.CUBE_HALFSIZE * 0.5
+                    new_pos = positions[i].clone()
+                    new_pos[:2] += noise
+                    
+                    # Check distance to all previously placed objects
+                    valid_position = True
+                    for j in range(i):
+                        distance = torch.norm(new_pos[:2] - positions[j][:2])
+                        if distance < min_distance:
+                            valid_position = False
+                            break
+                    
+                    if valid_position:
+                        positions[i] = new_pos
+                        break
+                    attempt += 1
+
+            # Shuffle positions
+            shuffled_indices = torch.randperm(len(positions), device=self.device).cpu().tolist()
+            shuffled_positions = [positions[i] for i in shuffled_indices]
+
+            # Assign shuffled positions back
+            for key, new_pos in zip(self.initial_poses.keys(), shuffled_positions):
+                self.initial_poses[key][env_i] = new_pos
+                # Update actual object poses as well
+                current_pose = self.cubes[key].pose.raw_pose.clone()
+                current_pose[env_i, :3] = new_pos
+                current_pose[env_i, 3:] = torch.tensor(
+                    [1, 0, 0, 0], device=self.device, dtype=current_pose.dtype
+                )
+                self.cubes[key].pose = current_pose
+
+        self.initial_raw_poses = {
+            key: self.cubes[key].pose.raw_pose.clone() for key in self.cubes.keys()
+        }
+        self._zero_cube_velocities(sleep=True)
+        self.oracle_info = self.true_color_indices
+
+        # Initialize robot arm to a higher position above the table than the default typically used for other table top tasks
+        if self.robot_uids == "panda" or self.robot_uids == "panda_wristcam":
+            # fmt: off
+            qpos = np.array(
+                [0.0, 0, 0, -np.pi * 2 / 3, 0, np.pi * 2 / 3, np.pi / 4, 0.04, 0.04]
+            )
+            # fmt: on
+            qpos[:-2] += self._episode_rng.normal(
+                0, self.robot_init_qpos_noise, len(qpos) - 2
+            )
+            self.agent.reset(qpos)
+            self.agent.robot.set_root_pose(sapien.Pose([-0.615, 0, 0]))
+        else:
+            raise NotImplementedError(self.robot_uids)
 
     def evaluate(self):
-        self.original_poses = {key: self.cubes[key].pose.raw_pose.clone() for key in self.cubes.keys()}
-        
         hidden_shapes_poses = {}
-        for key, shape in self.color_dict.items():
+        before_choice = self.elapsed_steps < self.TIME_OFFSET + self.DELTA_TIME
+        for key in self.color_dict:
             hidden_shapes_poses[key] = self.cubes[key].pose.raw_pose.clone()
-            hidden_shapes_poses[key][(self.elapsed_steps < self.TIME_OFFSET+self.DELTA_TIME), 2] = 1000
+            hidden_shapes_poses[key][before_choice, 2] = 1000
             self.cubes[key].pose = hidden_shapes_poses[key]
 
-        # Update other timing-dependent logic similarly
-        for key, shape in self.color_dict.items():
-            true_shape_mask = self.true_color_indices == key
+        for key in self.color_dict:
+            true_color_mask = self.true_color_indices == key
             b_ = hidden_shapes_poses[key].shape[0]
 
-            pre_choice_mask = true_shape_mask & (self.elapsed_steps < self.TIME_OFFSET + self.DELTA_TIME)
+            pre_choice_mask = true_color_mask & before_choice
             hidden_shapes_poses[key][pre_choice_mask, :3] = self.center_pose.repeat(b_, 1)[pre_choice_mask, :3]
 
             hidden_shapes_poses[key][
-                true_shape_mask \
-                & (self.TIME_OFFSET + self.DELTA_TIME >= self.elapsed_steps) \
-                & (self.elapsed_steps >= self.TIME_OFFSET), 
+                true_color_mask
+                & (self.TIME_OFFSET + self.DELTA_TIME >= self.elapsed_steps)
+                & (self.elapsed_steps >= self.TIME_OFFSET),
                 2
             ] = 1000
 
             self.cubes[key].pose = hidden_shapes_poses[key]
 
-        for key, shape in self.color_dict.items():
+        for key in self.color_dict:
             mask = self.elapsed_steps == self.TIME_OFFSET + self.DELTA_TIME
-            hidden_shapes_poses[key][mask, :3] = self.initial_poses[key][mask, :3]
+            hidden_shapes_poses[key][mask] = self.initial_raw_poses[key][mask]
             self.cubes[key].pose = hidden_shapes_poses[key]
-            if mask.any():
-                lin_vel = self.cubes[key].get_linear_velocity()
-                ang_vel = self.cubes[key].get_angular_velocity()
-                lin_vel[mask] = 0
-                ang_vel[mask] = 0
-                self.cubes[key].set_linear_velocity(lin_vel)
-                self.cubes[key].set_angular_velocity(ang_vel)
+
+        hidden_masks = {
+            key: hidden_pose[:, 2] > 100
+            for key, hidden_pose in hidden_shapes_poses.items()
+        }
+        if any(mask.any().item() for mask in hidden_masks.values()):
+            self._zero_cube_velocities(hidden_masks, sleep=True)
+
+        reveal_mask = self.elapsed_steps == self.TIME_OFFSET + self.DELTA_TIME
+        if reveal_mask.any():
+            self._zero_cube_velocities(reveal_mask, sleep=True)
+
+        if reveal_mask.any() or any(mask.any().item() for mask in hidden_masks.values()):
+            self._sync_cube_gpu_state()
 
         self.masks = {}
         for key, color in self.color_dict.items():
@@ -276,11 +325,6 @@ class RememberColorBaseEnv(BaseEnv):
             
         return obs
 
-    def step(self, action):
-        obs, reward, terminated, truncated, info = super().step(action)
-
-        return obs, reward, terminated, truncated, info
-    
     def compute_dense_reward(self, obs: Any, action: Array, info: Dict):
         tcp_to_obj_dist = torch.linalg.norm(self.obj_to_goal_pos, axis=1)
         reaching_reward = 1 - torch.tanh(10.0 * tcp_to_obj_dist)
@@ -317,14 +361,14 @@ class RememberColorBaseEnv(BaseEnv):
         return self.compute_dense_reward(obs=obs, action=action, info=info) / max_reward
     
     
-@register_env("RememberColor3-v0", max_episode_steps=60)
+@register_env("RememberColor3-v0", max_episode_steps=RememberColorBaseEnv.DEFAULT_MAX_EPISODE_STEPS)
 class RememberColor3Env(RememberColorBaseEnv):
     COLORS = 3
 
-@register_env("RememberColor5-v0", max_episode_steps=60)
+@register_env("RememberColor5-v0", max_episode_steps=RememberColorBaseEnv.DEFAULT_MAX_EPISODE_STEPS)
 class RememberColor5Env(RememberColorBaseEnv):
     COLORS = 5
 
-@register_env("RememberColor9-v0", max_episode_steps=60)
+@register_env("RememberColor9-v0", max_episode_steps=RememberColorBaseEnv.DEFAULT_MAX_EPISODE_STEPS)
 class RememberColor9Env(RememberColorBaseEnv):
     COLORS = 9
