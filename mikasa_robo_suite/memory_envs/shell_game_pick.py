@@ -6,7 +6,10 @@ from mani_skill import ASSET_DIR
 from mani_skill.agents.robots.fetch.fetch import Fetch
 from mani_skill.agents.robots.panda.panda import Panda
 from mani_skill.agents.robots.panda.panda_wristcam import PandaWristCam
-from mani_skill.agents.robots.xmate3.xmate3 import Xmate3Robotiq
+try:
+    from mani_skill.agents.robots.xmate3.xmate3 import Xmate3Robotiq
+except ImportError:
+    Xmate3Robotiq = None  # removed in mani_skill 3.0.1; the xmate3_robotiq robot is unused here
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils.randomization.pose import random_quaternions
 from mani_skill.sensors.camera import CameraConfig
